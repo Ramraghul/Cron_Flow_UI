@@ -32,6 +32,7 @@
   .auth-bar label { color: var(--muted); font-size: 13px; white-space: nowrap; }
   .auth-bar input { flex: 1; min-width: 200px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 12px; color: var(--text); font-size: 13px; }
   .auth-bar input:focus { outline: none; border-color: var(--accent); }
+  .auth-bar select { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; color: var(--text); font-size: 13px; }
 
   /* Buttons */
   button { cursor: pointer; border: none; border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 600; transition: opacity .15s, transform .1s; }
@@ -132,8 +133,9 @@
 
   <!-- Auth bar -->
   <div class="auth-bar">
-    <label>API Base URL:</label>
-    <input id="base-url" value="http://localhost:3000" placeholder="http://localhost:3000" style="max-width:240px;" />
+    <label>API:</label>
+    <select id="api-target" onchange="selectApiTarget(this.value)" title="Choose the API server"></select>
+    <input id="base-url" placeholder="https://your-api.example.com" style="max-width:260px;" />
     <label>JWT Token:</label>
     <input id="token-input" type="password" placeholder="Paste token from login..." style="max-width:320px;" />
     <button class="btn-primary" onclick="connect()">Connect</button>
@@ -172,7 +174,8 @@
       <div class="form-grid">
         <div class="form-group"><label>Workflow Name *</label><input id="wf-name" placeholder="Daily Report" /></div>
         <div class="form-group"><label>Cron Expression *</label><input id="wf-cron" placeholder="0 8 * * *" /></div>
-        <div class="form-group full"><label>Description</label><input id="wf-desc" placeholder="Optional description" /></div>
+        <div class="form-group"><label>Timezone</label><input id="wf-tz" placeholder="UTC" /></div>
+        <div class="form-group"><label>Description</label><input id="wf-desc" placeholder="Optional description" /></div>
       </div>
       <div style="margin-top:14px;">
         <div class="flex-between" style="margin-bottom:8px;">
@@ -261,8 +264,18 @@
 
 <script>
 // ─── State ─────────────────────────────────────────────────────────────────
-let BASE = 'http://localhost:3000';
+// API servers offered in the selector. Opened from this machine (localhost, or as a file) the dashboard
+// starts on "local"; hosted anywhere else it starts on "deployed". Any other URL can be entered as Custom.
+const API_TARGETS = [
+  { id: 'local', label: 'Local (localhost:3000)', url: 'http://localhost:3000' },
+  { id: 'deployed', label: 'Deployed (Vercel)', url: 'https://cron-flow-ramraghuls-projects.vercel.app' },
+];
+const IS_LOCAL = ['localhost', '127.0.0.1', ''].includes(location.hostname);
+const DEFAULT_BASE = API_TARGETS.find(t => t.id === (IS_LOCAL ? 'local' : 'deployed')).url;
 const API_PREFIX = '/api/v1';
+let BASE = DEFAULT_BASE;
+// Login token per API server: a token issued by one server is not valid on another.
+let savedTokens = {};
 let TOKEN = '';
 let steps = [];
 let stepCounter = 0;
@@ -271,35 +284,123 @@ let authMode = 'login';
 
 // ─── API helpers ────────────────────────────────────────────────────────────
 async function api(method, path, body) {
+  if (!BASE) throw new Error('Enter the API Base URL above, then click Connect');
   const headers = { 'Content-Type': 'application/json' };
-  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
-  const res = await fetch(BASE + API_PREFIX + path, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  // Remember which token this request used: several requests run in parallel, and the first 401 clears TOKEN.
+  const sentToken = TOKEN;
+  if (sentToken) headers['Authorization'] = `Bearer ${sentToken}`;
+  let res;
+  try {
+    res = await fetch(BASE + API_PREFIX + path, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error(`Cannot reach the API at ${BASE}. Check the URL, that the API is running, and that its CORS_ORIGINS allows ${location.origin}.`);
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // An expired or revoked token: forget it so the next action asks for a fresh login.
+    if (res.status === 401 && sentToken && !path.startsWith('/auth/')) {
+      if (TOKEN === sentToken) setToken('');
+      throw new Error('Your session has expired. Please log in again.');
+    }
     const message = Array.isArray(data.message) ? data.message.join('; ') : data.message;
     throw new Error(message || `HTTP ${res.status}`);
   }
   return data;
 }
 
+function saveConfig() {
+  if (BASE) {
+    if (TOKEN) savedTokens[BASE] = TOKEN;
+    else delete savedTokens[BASE];
+  }
+  try { localStorage.setItem('cronflow_config', JSON.stringify({ base: BASE, tokens: savedTokens })); } catch {}
+}
+
+function setToken(token) {
+  TOKEN = token;
+  document.getElementById('token-input').value = token;
+  saveConfig();
+}
+
+// Browsers allow http://localhost from an https page but block any other http:// API ("mixed content").
+function isBlockedMixedContent(base) {
+  const url = new URL(base);
+  return location.protocol === 'https:' && url.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(url.hostname);
+}
+
+// Accepts an API address with or without trailing slashes or the /api/v1 prefix, and returns the server part.
+function normaliseBase(value) {
+  return String(value || '').trim().replace(/\/+$/, '').replace(/\/api\/v1$/, '');
+}
+
+// Reads the API Base URL field; returns false (after telling the user why) if it can't be used.
+function applyBaseFromInput() {
+  const base = normaliseBase(document.getElementById('base-url').value);
+  try {
+    if (base && isBlockedMixedContent(base)) {
+      toast('This page is served over HTTPS, so the browser blocks an http:// API. Use the API’s https:// URL.', 'error');
+      return false;
+    }
+  } catch {
+    toast('The API Base URL is not a valid URL', 'error');
+    return false;
+  }
+  BASE = base;
+  document.getElementById('base-url').value = base;
+  return true;
+}
+
+// Switches to one of API_TARGETS and restores the login saved for that server; "custom" lets you type any URL.
+function selectApiTarget(id) {
+  const target = API_TARGETS.find(t => t.id === id);
+  if (!target) { document.getElementById('base-url').focus(); return; }
+  BASE = target.url;
+  document.getElementById('base-url').value = BASE;
+  TOKEN = savedTokens[BASE] || '';
+  document.getElementById('token-input').value = TOKEN;
+  saveConfig();
+  refresh();
+}
+
+function syncTargetSelector() {
+  const target = API_TARGETS.find(t => t.url === BASE);
+  document.getElementById('api-target').value = target ? target.id : 'custom';
+}
+
 // ─── Connect ────────────────────────────────────────────────────────────────
 function connect() {
-  BASE = document.getElementById('base-url').value.replace(/\/$/, '');
-  TOKEN = document.getElementById('token-input').value.trim();
+  if (!applyBaseFromInput()) return;
+  setToken(document.getElementById('token-input').value.trim());
   refresh();
 }
 
 async function refresh() {
+  syncTargetSelector();
+  if (!BASE) { setConnBadge(false); showLoggedOut(); return; }
   try {
     const health = await fetch(BASE + '/health/ready').then(r => r.json());
     setConnBadge(health.status === 'ok');
   } catch { setConnBadge(false); }
-  if (!TOKEN) return;
+  if (!TOKEN) { showLoggedOut(); return; }
   await Promise.allSettled([loadMetrics(), loadWorkflows(), loadApiKeys(), loadScheduler()]);
+}
+
+// Clears data shown from a previous server or session.
+function showLoggedOut() {
+  for (const id of ['s-total-wf', 's-active-wf', 's-paused-wf', 's-total-ex', 's-success-rate', 's-avg-dur']) {
+    document.getElementById(id).textContent = '—';
+  }
+  if (statusChart) { statusChart.destroy(); statusChart = null; }
+  if (triggerChart) { triggerChart.destroy(); triggerChart = null; }
+  for (const id of ['wf-table-wrap', 'keys-table-wrap', 'scheduler-wrap']) {
+    document.getElementById(id).innerHTML = '<div class="empty">Log in to load data from this server</div>';
+  }
+  document.getElementById('exec-wf-label').textContent = '';
+  document.getElementById('exec-table-wrap').innerHTML = '<div class="empty" style="color:var(--muted)">Select a workflow to view executions</div>';
 }
 
 function setConnBadge(ok) {
@@ -369,7 +470,8 @@ async function loadWorkflows() {
             <td>${wf.nextRunAt ? new Date(wf.nextRunAt).toLocaleString() : '—'}</td>
             <td>
               <div class="flex-gap">
-                <button class="btn-ghost btn-sm" onclick="loadExecutions('${wf.id}', '${esc(wf.name)}')">Executions</button>
+                <button class="btn-ghost btn-sm" data-name="${esc(wf.name)}" onclick="loadExecutions('${wf.id}', this.dataset.name)">Executions</button>
+                <button class="btn-ghost btn-sm" onclick="showWebhook('${wf.id}')">🔗 Webhook</button>
                 <button class="btn-primary btn-sm" onclick="triggerWorkflow('${wf.id}')">▶ Run</button>
                 ${wf.status === 'ACTIVE'
                   ? `<button class="btn-ghost btn-sm" onclick="pauseWorkflow('${wf.id}')">⏸ Pause</button>`
@@ -403,6 +505,22 @@ async function resumeWorkflow(id) {
   catch(e) { toast(e.message, 'error'); }
 }
 
+async function showWebhook(id) {
+  try {
+    const wf = await api('GET', `/workflows/${id}`);
+    const url = `${BASE}${API_PREFIX}/webhooks/${wf.webhookToken}/trigger`;
+    document.getElementById('key-modal-title').textContent = 'Webhook URL';
+    document.getElementById('key-modal-body').innerHTML = `
+      <p style="margin-bottom:12px;color:var(--muted);">POST to this URL to run “${esc(wf.name)}” from another system. No auth header is needed, so treat the URL like a password.</p>
+      <div class="api-key-row">${esc(url)}</div>
+      <div class="flex-gap" style="margin-top:16px;">
+        <button class="btn-primary" data-copy="${esc(url)}" onclick="copyText(this.dataset.copy)">Copy URL</button>
+        <button class="btn-ghost" onclick="closeModal('key-modal')">Close</button>
+      </div>`;
+    document.getElementById('key-modal').style.display = 'flex';
+  } catch(e) { toast(e.message, 'error'); }
+}
+
 async function deleteWorkflow(id) {
   if (!confirm('Delete this workflow?')) return;
   try { await api('DELETE', `/workflows/${id}`); toast('Deleted', 'info'); loadWorkflows(); loadScheduler(); loadMetrics(); }
@@ -414,6 +532,8 @@ function toggleCreateForm() {
   const el = document.getElementById('create-form-wrap');
   el.style.display = el.style.display === 'none' ? 'block' : 'none';
   if (steps.length === 0) addStep();
+  const tz = document.getElementById('wf-tz');
+  if (!tz.value) tz.value = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 }
 
 function addStep() {
@@ -451,6 +571,7 @@ async function createWorkflow() {
   const name = document.getElementById('wf-name').value.trim();
   const cron = document.getElementById('wf-cron').value.trim();
   const desc = document.getElementById('wf-desc').value.trim();
+  const timezone = document.getElementById('wf-tz').value.trim();
   if (!name || !cron) { toast('Name and cron expression required', 'error'); return; }
 
   const parsedSteps = steps.map((s, i) => {
@@ -460,7 +581,7 @@ async function createWorkflow() {
   });
 
   try {
-    await api('POST', '/workflows', { name, cronExpression: cron, description: desc, steps: parsedSteps });
+    await api('POST', '/workflows', { name, cronExpression: cron, description: desc || undefined, timezone: timezone || undefined, steps: parsedSteps });
     toast('Workflow created!', 'success');
     document.getElementById('wf-name').value = '';
     document.getElementById('wf-cron').value = '';
@@ -600,10 +721,10 @@ async function submitAuth() {
   const email = document.getElementById('auth-email').value.trim();
   const password = document.getElementById('auth-password').value;
   if (!email || !password) { toast('Email and password required', 'error'); return; }
+  if (!applyBaseFromInput()) return;
   try {
     const r = await api('POST', `/auth/${authMode}`, { email, password });
-    TOKEN = r.accessToken;
-    document.getElementById('token-input').value = TOKEN;
+    setToken(r.accessToken);
     closeModal('login-modal');
     toast(`${authMode === 'login' ? 'Logged in' : 'Registered'} as ${r.user.email}`, 'success');
     refresh();
@@ -630,21 +751,23 @@ function toast(msg, type = 'info') {
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 // Poll health every 30s
-setInterval(() => fetch(BASE + '/health/ready').then(r => r.json()).then(d => setConnBadge(d.status==='ok')).catch(() => setConnBadge(false)), 30000);
+setInterval(() => { if (BASE) fetch(BASE + '/health/ready').then(r => r.json()).then(d => setConnBadge(d.status==='ok')).catch(() => setConnBadge(false)); }, 30000);
 
-// Load from localStorage if available
+document.getElementById('api-target').innerHTML =
+  API_TARGETS.map(t => `<option value="${t.id}">${esc(t.label)}</option>`).join('') + '<option value="custom">Custom URL…</option>';
+
+// Restore settings: ?api=<url> in the page address wins, then the last server used, then the default.
 try {
   const saved = JSON.parse(localStorage.getItem('cronflow_config') || '{}');
-  if (saved.base) document.getElementById('base-url').value = saved.base;
-  if (saved.token) { document.getElementById('token-input').value = saved.token; TOKEN = saved.token; BASE = saved.base || BASE; refresh(); }
+  // Earlier versions saved a single token; keep it for the server it belonged to.
+  savedTokens = saved.tokens || (saved.base && saved.token ? { [normaliseBase(saved.base)]: saved.token } : {});
+  const fromQuery = new URLSearchParams(location.search).get('api');
+  BASE = normaliseBase(fromQuery || saved.base || DEFAULT_BASE);
 } catch {}
-
-// Save config on connect
-const origConnect = connect;
-connect = function() {
-  origConnect();
-  try { localStorage.setItem('cronflow_config', JSON.stringify({ base: BASE, token: TOKEN })); } catch {}
-};
+TOKEN = savedTokens[BASE] || '';
+document.getElementById('base-url').value = BASE;
+document.getElementById('token-input').value = TOKEN;
+refresh();
 </script>
 </body>
 </html>
